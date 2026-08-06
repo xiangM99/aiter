@@ -21,7 +21,7 @@ from aiter.ops.attention import get_mla_decode_fwd_max_splits
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,
+    O,  # noqa: E741
     Final_lse,
     qo_indptr,
     kv_indptr,
@@ -498,43 +498,91 @@ def mla_decode_fwd(
             else None
         )
 
-        # Per-batch valid KV split count writeback buffer. Always allocated (and
-        # passed to stage1) so the asm kernel has a valid destination; whether
-        # stage2 actually uses it is gated by use_valid_split_count_reduce.
-        # Initialized to num_kv_splits so a min() against it is a no-op until the
-        # kernel overwrites it with the real (smaller) valid count.
+        # Per-batch valid KV split count buffer. Always allocated so stage2 can
+        # use the ASM writeback or the page count filled by the FlyDSL path.
+        # Initialized to num_kv_splits so a min() against it is a no-op until
+        # the selected stage1 path replaces it with the smaller valid count.
         valid_split_count = torch.full(
             (bs,), num_kv_splits, dtype=dtypes.i32, device=device
         )
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-        aiter.mla_decode_stage1_asm_fwd(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            num_kv_splits_indptr,
-            None,
-            None,
-            None,
-            max_seqlen_q,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            logits,
-            attn_lse,
-            o,
-            final_lse,
-            q_scale,
-            kv_scale,
-            g_kv_indptr,
-            cp_world_size,
-            cp_rank,
-            valid_split_count,
-            use_valid_split_count_reduce,
+        gfx1250_backend = os.getenv("AITER_MLA_GFX1250_BACKEND", "asm").strip().lower()
+        if gfx1250_backend not in {"asm", "flydsl"}:
+            raise ValueError(
+                "AITER_MLA_GFX1250_BACKEND must be 'asm' or 'flydsl', "
+                f"got {gfx1250_backend!r}"
+            )
+        use_flydsl_qh128 = (
+            gfx1250_backend == "flydsl"
+            and get_gfx() == "gfx1250"
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and nhead == 128
+            and nhead_kv == 1
+            and max_seqlen_q == 1
+            and page_size == 64
+            and cp_world_size == 1
         )
+        if use_flydsl_qh128:
+            from aiter.ops.flydsl.kernels.mla_gfx1250.mla_pagesize64_fp8_fp8 import (
+                mla_fwd_decode_pagesize64_fp8_fp8_gfx1250,
+            )
+
+            flydsl_split_data = (
+                logits.view(total_s, nhead, v_head_dim)
+                if num_kv_splits == 1
+                else logits
+            )
+            flydsl_kv_buffer = kv_buffer.view(kv_buffer.size(0), -1)
+            mla_fwd_decode_pagesize64_fp8_fp8_gfx1250(
+                split_data=flydsl_split_data,
+                split_lse=attn_lse,
+                q=q,
+                kv_buffer=flydsl_kv_buffer,
+                kv_indptr=kv_indptr,
+                kv_page_indices=kv_indices,
+                kv_last_page_lens=kv_last_page_lens,
+                qo_indptr=qo_indptr,
+                num_kv_splits_indptr=num_kv_splits_indptr,
+                q_scale=q_scale,
+                kv_scale=kv_scale,
+                softmax_scale=sm_scale,
+                num_splits=num_kv_splits,
+                page_size=page_size,
+                stream=torch.cuda.current_stream(device),
+            )
+            valid_split_count.copy_(
+                (kv_indptr[1:] - kv_indptr[:-1]).clamp(max=num_kv_splits)
+            )
+        else:
+            aiter.mla_decode_stage1_asm_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                None,
+                None,
+                None,
+                max_seqlen_q,
+                page_size,
+                nhead_kv,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                final_lse,
+                q_scale,
+                kv_scale,
+                g_kv_indptr,
+                cp_world_size,
+                cp_rank,
+                valid_split_count,
+                use_valid_split_count_reduce,
+            )
 
         if num_kv_splits == 1 and (
             q.dtype == dtypes.fp8
@@ -548,7 +596,10 @@ def mla_decode_fwd(
                 q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16 and nhead == 8
             )
         ):
-            lse = final_lse if return_lse else attn_lse
+            if use_flydsl_qh128 and return_lse:
+                lse = attn_lse.view(total_s, nhead)
+            else:
+                lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
 
         Lv = v_head_dim
