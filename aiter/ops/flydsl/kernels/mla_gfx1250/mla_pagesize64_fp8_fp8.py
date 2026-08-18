@@ -9,7 +9,6 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, tdm_ops
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
@@ -24,45 +23,16 @@ NUM_WAVES = BLOCK_THREADS // WAVE_SIZE
 NUM_HEAD_GROUPS = 2
 HEADS_PER_WAVE = 16
 HEADS_PER_GROUP = NUM_WAVES * HEADS_PER_WAVE
-MAPPING_DEBUG_FIELDS = 4
-Q_SAMPLE_DIMS = (0, 511, 512, 575)
-Q_DEBUG_FIELDS = 2 * len(Q_SAMPLE_DIMS)
-Q_TDM_SAMPLE_COORDS = ((0, 0), (0, 127), (0, 511), (15, 0), (15, 127), (15, 511))
-Q_TDM_DEBUG_FIELDS = len(Q_TDM_SAMPLE_COORDS)
-Q_TDM_DEBUG_BASE = MAPPING_DEBUG_FIELDS + Q_DEBUG_FIELDS
-Q_ROPE_SAMPLE_COORDS = ((0, 0), (0, 15), (0, 63), (15, 0), (15, 15), (15, 63))
-Q_ROPE_DEBUG_FIELDS = len(Q_ROPE_SAMPLE_COORDS)
-Q_ROPE_DEBUG_BASE = Q_TDM_DEBUG_BASE + Q_TDM_DEBUG_FIELDS
-Q_FRAGMENT_DEBUG_BASE = Q_ROPE_DEBUG_BASE + Q_ROPE_DEBUG_FIELDS
 Q_NOPE_FRAGMENT_COUNT = 4
 Q_NOPE_FRAGMENT_DWORDS = 16
 Q_ROPE_FRAGMENT_DWORDS = 8
-Q_FRAGMENT_DEBUG_DWORDS = (
-    Q_NOPE_FRAGMENT_COUNT * Q_NOPE_FRAGMENT_DWORDS + Q_ROPE_FRAGMENT_DWORDS
-)
-KV_NOPE_SAMPLE_COORDS = Q_TDM_SAMPLE_COORDS
-KV_NOPE_DEBUG_FIELDS = len(KV_NOPE_SAMPLE_COORDS)
-KV_NOPE_DEBUG_BASE = Q_FRAGMENT_DEBUG_BASE + Q_FRAGMENT_DEBUG_DWORDS
-KV_ROPE_SAMPLE_COORDS = Q_ROPE_SAMPLE_COORDS
-KV_ROPE_DEBUG_FIELDS = len(KV_ROPE_SAMPLE_COORDS)
-KV_ROPE_DEBUG_BASE = KV_NOPE_DEBUG_BASE + KV_NOPE_DEBUG_FIELDS
 QK_N_TILES = 4
 QK_TILE_DS_OPS = Q_NOPE_FRAGMENT_COUNT * 4 + 2
-QK_ACC_DEBUG_BASE = MAPPING_DEBUG_FIELDS
 QK_ACC_DWORDS = 8
-QK_ACC_DEBUG_DWORDS = QK_N_TILES * QK_ACC_DWORDS
-PAGE_MAX_DEBUG_BASE = QK_ACC_DEBUG_BASE + QK_ACC_DEBUG_DWORDS
-PAGE_SUM_DEBUG_BASE = PAGE_MAX_DEBUG_BASE + 1
-LSE_DEBUG_BASE = PAGE_SUM_DEBUG_BASE + 1
-PROB_DEBUG_BASE = LSE_DEBUG_BASE + 1
-PROB_DEBUG_VALUES = QK_ACC_DEBUG_DWORDS
-PACKED_PROB_DEBUG_BASE = PROB_DEBUG_BASE + PROB_DEBUG_VALUES
-PACKED_PROB_WORDS = PROB_DEBUG_VALUES // 4
-PV_ACC_DEBUG_BASE = PACKED_PROB_DEBUG_BASE + PACKED_PROB_WORDS
+PACKED_PROB_WORDS = 8
 PV_ACC_DWORDS = 8
 PV_D_TILES = 32
 PV_LOAD_DEPTH = 8
-DEBUG_FIELDS = PV_ACC_DEBUG_BASE + PV_ACC_DWORDS
 NUM_Q_HEADS = 128
 QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
@@ -94,25 +64,10 @@ _XOR16_SEL_HI = 0xFEDCBA98 - (1 << 32)
 
 
 def _xor16_f32(value):
-    """Wave32 ``lane ^ 16`` exchange of an f32, on the VALU rather than in LDS.
-
-    The obvious spelling, ``shuffle_xor(16, WAVE_SIZE)``, lowers to
-    ``ds_bpermute_b32``. That shares the ``dscnt`` counter with the KV
-    ``ds_load``s, so reading its result costs an ``s_wait_dscnt 0x0`` that
-    drains every in-flight KV load. ``v_permlanex16_b32`` leaves the LDS
-    pipeline alone.
-
-    ``v_permlane16_swap_b32`` expresses the same exchange in one instruction
-    instead of two, but it writes both of its operands, and the VGPR-MSB
-    encoding pass mis-banks the second write once allocation crosses 256
-    registers -- the stray write lands on a live address register and faults.
-    """
     sel_lo = fx.Int32(_XOR16_SEL_LO).ir_value()
     sel_hi = fx.Int32(_XOR16_SEL_HI).ir_value()
     src = value.ir_value()
-    return fx.Float32(
-        rocdl.permlanex16(T.f32, src, src, sel_lo, sel_hi, False, False)
-    )
+    return fx.Float32(rocdl.permlanex16(T.f32, src, src, sel_lo, sel_hi, False, False))
 
 
 def _dword_iter(ptr):
@@ -123,7 +78,6 @@ def _dword_iter(ptr):
 
 
 def _dwordx4_iter(ptr):
-    """Dword-indexed view of `ptr` that is known to be 16-byte aligned."""
     return fx.recast_iter(
         fx.PointerType.get(fx.Int32.ir_type, ptr.memspace, 16),
         ptr,
@@ -131,7 +85,6 @@ def _dwordx4_iter(ptr):
 
 
 def make_global_load_b128():
-    """Return a callable issuing one 16-byte per-lane load into registers."""
     layout = fx.make_layout(4, 1)
     atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.Int32)
 
@@ -143,15 +96,8 @@ def make_global_load_b128():
 
     return load
 
-def _rope_row_to_lds(src, src_dword, lds_base, lds_offset):
-    """Stage one 16-byte RoPE chunk per lane into LDS.
 
-    The s_wait_alu is mandatory. global_load_async_to_lds_b128 reads its address
-    and LDS-destination VGPRs without interlocking against in-flight VALU writes,
-    and LLVM's hazard recognizer does not model that for this instruction. Without
-    the barrier the load consumes stale operands, so it either faults on a garbage
-    address or silently drops the chunk and the RoPE block reads back as zero.
-    """
+def _rope_row_to_lds(src, src_dword, lds_base, lds_offset):
     from flydsl._mlir.dialects import llvm as _llvm
 
     rocdl.sched_barrier(0)
@@ -372,7 +318,7 @@ def launch_mla_pagesize64_fp8_fp8(
         lane_half = lane_id >> 4
         head = head_group * HEADS_PER_GROUP + wave_id * HEADS_PER_WAVE + head_in_wave
 
-        #交错读取LDS
+        # ????LDS
         def lds_segment_byte(slot):
             return (wave_id * LDS_WAVE_BYTES) ^ (slot * LDS_WAVE_BYTES)
 
@@ -663,9 +609,7 @@ def launch_mla_pagesize64_fp8_fp8(
                     rocdl.s_wait_dscnt(PV_LOAD_DEPTH * QK_N_TILES)
                 else:
                     rocdl.s_wait_dscnt((PV_D_TILES - 1 - dv_tile) * QK_N_TILES)
-                updated_outs.append(
-                    finish_pv_tile(dv_tile, staged_v.pop(dv_tile))
-                )
+                updated_outs.append(finish_pv_tile(dv_tile, staged_v.pop(dv_tile)))
             return updated_outs
 
         pending_meta_zero = Vec.filled(3, 0, fx.Int32)
@@ -814,9 +758,7 @@ def launch_mla_pagesize64_fp8_fp8(
                 qk_acc = qk_accs[n_tile]
                 for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
                     remaining_ds = (
-                        (Q_NOPE_FRAGMENT_COUNT - 1 - k_fragment) * 4
-                        + 2
-                        + inflight_next
+                        (Q_NOPE_FRAGMENT_COUNT - 1 - k_fragment) * 4 + 2 + inflight_next
                     )
                     rocdl.s_wait_dscnt(remaining_ds)
                     k_operand = _rmem_i32(
@@ -852,9 +794,7 @@ def launch_mla_pagesize64_fp8_fp8(
                 masked_tile = []
                 for i in range_constexpr(QK_ACC_DWORDS):
                     if const_expr(mask_last):
-                        logical_key = (
-                            lds_segment_token_base(n_tile) + lane_half * 8 + i
-                        )
+                        logical_key = lds_segment_token_base(n_tile) + lane_half * 8 + i
                         valid_key = fx.Int32(logical_key) < page_valid_len
                         masked_tile.append(
                             valid_key.select(
