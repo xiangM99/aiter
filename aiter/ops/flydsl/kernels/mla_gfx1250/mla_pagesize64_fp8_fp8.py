@@ -821,6 +821,7 @@ def launch_mla_pagesize64_fp8_fp8(
 
             probabilities = []
             local_sum = fx.Float32(0.0)
+            sum_vector = Vec.filled(QK_ACC_DWORDS, 0, fx.Float32)
             for n_tile in range_constexpr(QK_N_TILES):
                 with fx.fastmath(fm_no_inf):
                     if const_expr(mask_last):
