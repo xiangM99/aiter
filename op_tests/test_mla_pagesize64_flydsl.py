@@ -169,7 +169,7 @@ def _torch_stage1_reference(case, batch, num_splits, softmax_scale):
 @benchmark()
 def test_mla_pagesize64_flydsl(batch=1, ctx_len=65, num_splits=1):
     from aiter.ops.flydsl.mla_kernels import (
-        mla_fwd_decode_pagesize64_fp8_fp8_gfx1250,
+        flydsl_mla_pagesize64_fp8_fp8,
     )
 
     case = _build_case(batch, ctx_len, num_splits)
@@ -198,7 +198,7 @@ def test_mla_pagesize64_flydsl(batch=1, ctx_len=65, num_splits=1):
     valid_split_count = torch.full((batch,), num_splits, dtype=torch.int32)
 
     def run_flydsl():
-        mla_fwd_decode_pagesize64_fp8_fp8_gfx1250(
+        flydsl_mla_pagesize64_fp8_fp8(
             split_data=flydsl_split_data,
             split_lse=flydsl_split_lse,
             q=case["q"],
@@ -313,7 +313,7 @@ def test_mla_pagesize64_flydsl(batch=1, ctx_len=65, num_splits=1):
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "mla_pagesize64_fp8_fp8_flydsl unsupported on %s; skipping", get_gfx()
+            "flydsl_mla_pagesize64_fp8_fp8 unsupported on %s; skipping", get_gfx()
         )
         return
 
@@ -326,7 +326,7 @@ def main():
         "--batch",
         type=int,
         nargs="*",
-        default=[1, 2],
+        default=[1, 2, 4],
         help="Batch sizes. e.g.: -b 1 4",
     )
     parser.add_argument(
@@ -334,7 +334,7 @@ def main():
         "--ctx-len",
         type=int,
         nargs="*",
-        default=[1024, 2048, 5000, 8192],
+        default=[2048, 5000, 8192, 16384],
         help="Context lengths. e.g.: -c 64 65 1024",
     )
     parser.add_argument(
@@ -354,7 +354,7 @@ def main():
     ]
     df = pd.DataFrame(rows)
     aiter.logger.info(
-        "mla_pagesize64_fp8_fp8_flydsl summary (markdown):\n%s",
+        "flydsl_mla_pagesize64_fp8_fp8 summary (markdown):\n%s",
         df.to_markdown(index=False),
     )
 

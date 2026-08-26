@@ -8,6 +8,7 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
@@ -126,7 +127,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 address_space=fx.AddressSpace.Shared,
                 alignment=8,
             ),
-            fx.index_cast(T.i32, lds_base_idx),
+            fx.Int32(lds_base_idx),
         )
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
         global_load_b128 = make_global_load_b128()
@@ -139,8 +140,8 @@ def launch_mla_pagesize1_fp8_fp8(
             num_records_bytes=page_indices_nbytes.ir_value(),
         )
 
-        tid = fx.Int32(fx.thread_idx.x)
-        worker_idx = fx.Int32(fx.block_idx.x)
+        tid = fx.thread_idx.x
+        worker_idx = fx.block_idx.x
         wave_id = rocdl.readfirstlane(T.i32, tid >> 5)
         lane_id = tid & (WAVE_SIZE - 1)
         head_in_wave = lane_id & (HEADS_PER_WAVE - 1)
@@ -210,6 +211,19 @@ def launch_mla_pagesize1_fp8_fp8(
             global_byte_offset=fx.Int64(QK_NOPE_HEAD_DIM),
         )
 
+        def prefetch_page_indices(tile_start):
+            wave_token_start = tile_start + wave_id * KV_GATHER_ROWS_PER_WAVE
+            safe_token = (wave_token_start < num_pages).select(
+                wave_token_start, fx.Int32(0)
+            )
+            byte_addr = page_indices_addr + fx.Int64(safe_token) * 4
+            rocdl.global_prefetch(
+                llvm_dialect.inttoptr(
+                    ir.Type.parse("!llvm.ptr<1>"), byte_addr.ir_value()
+                ),
+                tdm_ops.PREFETCH_SCOPE_SE,
+            )
+
         def prepare_kv_tile(tile_start, kv_end, raw_slot):
             slot_byte_offset = raw_slot * KV_SLOT_BYTES
             wave_token_start = tile_start + wave_id * KV_GATHER_ROWS_PER_WAVE
@@ -229,6 +243,7 @@ def launch_mla_pagesize1_fp8_fp8(
                     is_scalar=True,
                 )
             )
+            rocdl.sched_barrier(0)
             row_indices = []
             for i in range_constexpr(KV_GATHER_ROWS_PER_WAVE):
                 token_position = wave_token_start + i
@@ -444,6 +459,9 @@ def launch_mla_pagesize1_fp8_fp8(
             has_producer = producer_tile_start < kv_end
             safe_producer_start = has_producer.select(producer_tile_start, tile_start)
             rocdl.s_barrier_signal(-1)
+            # The backend schedules prepare_kv_tile's index loads after the PV block,
+            # so warm their cache line here and let the PV work cover the miss.
+            prefetch_page_indices(safe_producer_start)
             producer_nope_descriptor, producer_rope_descriptor = prepare_kv_tile(
                 safe_producer_start,
                 kv_end,
@@ -459,7 +477,7 @@ def launch_mla_pagesize1_fp8_fp8(
             rocdl.s_barrier_wait(-1)
 
             if has_producer:
-                issue_prepared_kv_tile(
+                (
                     producer_nope_descriptor,
                     producer_rope_descriptor,
                 )
@@ -610,17 +628,19 @@ def launch_mla_pagesize1_fp8_fp8(
 
             packed_probability_words = Vec.from_elements(packed_words, fx.Int32)
 
-            with fx.fastmath(fm_no_inf):
-                scaled_outs = [
-                    pv_ready_outs[d_tile] * alpha
-                    for d_tile in range_constexpr(PV_REG_D_TILES)
-                ]
+            scaled_outs = pv_ready_outs
+            if tile_max > running_max:
+                with fx.fastmath(fm_no_inf):
+                    scaled_outs = [
+                        pv_ready_outs[d_tile] * alpha
+                        for d_tile in range_constexpr(PV_REG_D_TILES)
+                    ]
 
             return [new_max, new_sum] + scaled_outs + [packed_probability_words]
 
         work_start = fx.Int32(rocdl.readfirstlane(T.i32, work_indptr[worker_idx]))
         work_end = fx.Int32(
-            rocdl.readfirstlane(T.i32, work_indptr[worker_idx + fx.Int32(1)])
+            rocdl.readfirstlane(T.i32, work_indptr[worker_idx + 1])
         )
 
         for work_idx in range(
@@ -815,7 +835,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 output_lds,
                 output_global,
             )
-            if lane_half == fx.Int32(0):
+            if lane_half == 0:
                 lse = has_mass.select(
                     running_max + fmath.log(running_sum),
                     fx.Float32(float("-inf")),

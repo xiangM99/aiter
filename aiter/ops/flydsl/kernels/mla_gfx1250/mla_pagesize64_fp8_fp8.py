@@ -5,20 +5,16 @@
 
 import math
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, tdm_ops
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.runtime.device import get_rocm_arch
 
 from ..gemm_common_gfx1250 import make_lds_copy_ops
 from .mla_common import (
     _dwordx4_iter,
-    _instruction_prefetch,
     _xor16_f32,
     make_global_load_b128,
 )
@@ -85,134 +81,6 @@ def _rope_row_to_lds(src, src_dword, lds_base, lds_offset):
     rocdl.sched_barrier(0)
 
 
-def _require(condition, message):
-    if not condition:
-        raise ValueError(message)
-
-
-def _validate_stage1_inputs(
-    split_data,
-    split_lse,
-    q,
-    kv_buffer,
-    kv_indptr,
-    kv_page_indices,
-    kv_last_page_lens,
-    qo_indptr,
-    num_kv_splits_indptr,
-    q_scale,
-    kv_scale,
-    softmax_scale,
-    num_splits,
-    page_size,
-):
-    arch = str(get_rocm_arch() or "").split(":", 1)[0]
-    _require(arch == "gfx1250", f"expected gfx1250, got {arch or 'unknown'}")
-    _require(
-        isinstance(num_splits, int) and not isinstance(num_splits, bool),
-        f"num_splits: expected int, got {type(num_splits).__name__}",
-    )
-    _require(num_splits > 0, f"num_splits: expected positive value, got {num_splits}")
-    _require(
-        page_size == PAGE_SIZE, f"page_size: expected {PAGE_SIZE}, got {page_size}"
-    )
-
-    _require(
-        q.dtype == torch.float8_e4m3fn,
-        f"q: expected torch.float8_e4m3fn, got {q.dtype}",
-    )
-    _require(
-        q.ndim == 3 and tuple(q.shape[1:]) == (NUM_Q_HEADS, QK_HEAD_DIM),
-        f"q: expected [total_q, {NUM_Q_HEADS}, {QK_HEAD_DIM}], got {list(q.shape)}",
-    )
-    expected_q_stride = (Q_ROW_STRIDE, Q_HEAD_STRIDE, 1)
-    _require(
-        tuple(q.stride()) == expected_q_stride,
-        f"q: expected padded stride {list(expected_q_stride)}, got {list(q.stride())}",
-    )
-    batch = q.size(0)
-    _require(batch > 0, "q: total_q/batch must be positive")
-
-    _require(
-        kv_buffer.dtype == torch.float8_e4m3fn,
-        f"kv_buffer: expected torch.float8_e4m3fn, got {kv_buffer.dtype}",
-    )
-    _require(
-        kv_buffer.ndim == 2 and kv_buffer.size(1) == KV_PAGE_ELEMENTS,
-        "kv_buffer: expected a segmented 2D page view "
-        f"[num_pages, {KV_PAGE_ELEMENTS}]; token-major 4D tensors are not accepted",
-    )
-    _require(kv_buffer.size(0) > 0, "kv_buffer: num_pages must be positive")
-    _require(
-        tuple(kv_buffer.stride()) == (KV_PAGE_ELEMENTS, 1),
-        "kv_buffer: expected contiguous segmented pages with "
-        f"page stride 0x{KV_PAGE_ELEMENTS:x}, got stride {list(kv_buffer.stride())}",
-    )
-
-    int32_inputs = {
-        "kv_indptr": (kv_indptr, (batch + 1,)),
-        "kv_page_indices": (kv_page_indices, None),
-        "kv_last_page_lens": (kv_last_page_lens, (batch,)),
-        "qo_indptr": (qo_indptr, (batch + 1,)),
-        "num_kv_splits_indptr": (num_kv_splits_indptr, (batch + 1,)),
-    }
-    for name, (tensor, expected_shape) in int32_inputs.items():
-        _require(
-            tensor.dtype == torch.int32,
-            f"{name}: expected torch.int32, got {tensor.dtype}",
-        )
-        _require(
-            tensor.ndim == 1,
-            f"{name}: expected a 1D tensor, got shape {list(tensor.shape)}",
-        )
-        if expected_shape is not None:
-            _require(
-                tuple(tensor.shape) == expected_shape,
-                f"{name}: expected shape {list(expected_shape)}, got {list(tensor.shape)}",
-            )
-        _require(tensor.is_contiguous(), f"{name}: expected a contiguous tensor")
-    _require(kv_page_indices.numel() > 0, "kv_page_indices: must not be empty")
-
-    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
-        _require(
-            scale.dtype == torch.float32,
-            f"{name}: expected torch.float32, got {scale.dtype}",
-        )
-        _require(
-            tuple(scale.shape) == (1,),
-            f"{name}: expected shape [1], got {list(scale.shape)}",
-        )
-        _require(scale.is_contiguous(), f"{name}: expected a contiguous tensor")
-
-    if num_splits == 1:
-        expected_data_shape = (batch, NUM_Q_HEADS, V_HEAD_DIM)
-        expected_data_dtype = torch.bfloat16
-    else:
-        expected_data_shape = (batch, num_splits, NUM_Q_HEADS, V_HEAD_DIM)
-        expected_data_dtype = torch.float32
-    _require(
-        split_data.dtype == expected_data_dtype,
-        f"split_data: expected {expected_data_dtype} for num_splits={num_splits}, got {split_data.dtype}",
-    )
-    _require(
-        tuple(split_data.shape) == expected_data_shape,
-        f"split_data: expected shape {list(expected_data_shape)}, got {list(split_data.shape)}",
-    )
-    _require(split_data.is_contiguous(), "split_data: expected a contiguous tensor")
-
-    expected_lse_shape = (batch, num_splits, NUM_Q_HEADS, 1)
-    _require(
-        split_lse.dtype == torch.float32,
-        f"split_lse: expected torch.float32, got {split_lse.dtype}",
-    )
-    _require(
-        tuple(split_lse.shape) == expected_lse_shape,
-        f"split_lse: expected shape {list(expected_lse_shape)}, got {list(split_lse.shape)}",
-    )
-    _require(split_lse.is_contiguous(), "split_lse: expected a contiguous tensor")
-    return batch
-
-
 @flyc.jit
 def launch_mla_pagesize64_fp8_fp8(
     ptr_r: fx.Pointer,
@@ -264,7 +132,7 @@ def launch_mla_pagesize64_fp8_fp8(
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
         global_load_b128 = make_global_load_b128()
 
-        tid = fx.Int32(fx.thread_idx.x)
+        tid = fx.thread_idx.x
         _, batch_id, z = fx.block_idx
 
         head_group = z & 1
@@ -321,7 +189,6 @@ def launch_mla_pagesize64_fp8_fp8(
         rope_chunk = lane_id & 3
         rocdl.sched_barrier(0)
 
-        # ----------------------------------------------
         def _concat_wmma_operand(chunks):
             v01 = chunks[0].shuffle(chunks[1], list(range(8)))
             v23 = chunks[2].shuffle(chunks[3], list(range(8)))
@@ -357,7 +224,7 @@ def launch_mla_pagesize64_fp8_fp8(
         scale_log2 = score_scale * fx.Float32(LOG2E)
 
         page_begin = kv_indptr[batch_id]
-        page_end = kv_indptr[batch_id + fx.Int32(1)]
+        page_end = kv_indptr[batch_id + 1]
 
         split_page_begin = page_begin + split_id
         has_pages = split_page_begin < page_end
@@ -451,20 +318,17 @@ def launch_mla_pagesize64_fp8_fp8(
             if third_page < page_end:
                 issue_kv_page(kv_page_indices[third_page], fx.Int32(2))
 
-        q_nope_fragments = q_nope_chunks
-        q_rope_fragment = q_rope_chunks
-
         q_nope_operands = []
         for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
             q_nope_operands.append(
                 _rmem_i32(
                     Q_NOPE_FRAGMENT_DWORDS,
-                    _concat_wmma_operand(q_nope_fragments[k_fragment]),
+                    _concat_wmma_operand(q_nope_chunks[k_fragment]),
                 )
             )
         q_rope_operand = _rmem_i32(
             Q_ROPE_FRAGMENT_DWORDS,
-            _concat_wmma_operand_k64(q_rope_fragment),
+            _concat_wmma_operand_k64(q_rope_chunks),
         )
 
         def compute_pending_pv(
@@ -618,7 +482,7 @@ def launch_mla_pagesize64_fp8_fp8(
             qk_accs = []
             for _ in range_constexpr(QK_N_TILES):
                 qk_acc = fx.make_rmem_tensor(QK_ACC_DWORDS, fx.Float32)
-                qk_acc.store(fx.constant_vector(0.0, T.vec(QK_ACC_DWORDS, T.f32)))
+                qk_acc.store(Vec.filled(QK_ACC_DWORDS, 0.0, fx.Float32))
                 qk_accs.append(qk_acc)
             pv_ready_outs = running_outs
             if const_expr(pv_pending):
@@ -1051,64 +915,6 @@ def launch_mla_pagesize64_fp8_fp8(
     ).launch(
         grid=(1, batch, NUM_HEAD_GROUPS * num_splits),
         block=(BLOCK_THREADS, 1, 1),
-        stream=stream,
-    )
-
-
-def mla_fwd_decode_pagesize64_fp8_fp8_gfx1250(
-    split_data,
-    split_lse,
-    q,
-    kv_buffer,
-    kv_indptr,
-    kv_page_indices,
-    kv_last_page_lens,
-    qo_indptr,
-    num_kv_splits_indptr,
-    q_scale,
-    kv_scale,
-    softmax_scale,
-    num_splits,
-    *,
-    page_size=PAGE_SIZE,
-    stream=None,
-):
-    batch = _validate_stage1_inputs(
-        split_data,
-        split_lse,
-        q,
-        kv_buffer,
-        kv_indptr,
-        kv_page_indices,
-        kv_last_page_lens,
-        qo_indptr,
-        num_kv_splits_indptr,
-        q_scale,
-        kv_scale,
-        softmax_scale,
-        num_splits,
-        page_size,
-    )
-    if stream is None:
-        stream = torch.cuda.current_stream(q.device)
-    output_type = fx.BFloat16 if num_splits == 1 else fx.Float32
-
-    launch_mla_pagesize64_fp8_fp8(
-        flyc.from_c_void_p(output_type, split_data.data_ptr()),
-        flyc.from_c_void_p(fx.Float32, split_lse.data_ptr()),
-        flyc.from_c_void_p(fx.Int8, q.data_ptr()),
-        flyc.from_c_void_p(fx.Int8, kv_buffer.data_ptr()),
-        flyc.from_c_void_p(fx.Int32, kv_indptr.data_ptr()),
-        flyc.from_c_void_p(fx.Int32, kv_page_indices.data_ptr()),
-        flyc.from_c_void_p(fx.Int32, kv_last_page_lens.data_ptr()),
-        flyc.from_c_void_p(fx.Int32, qo_indptr.data_ptr()),
-        flyc.from_c_void_p(fx.Int32, num_kv_splits_indptr.data_ptr()),
-        flyc.from_c_void_p(fx.Float32, q_scale.data_ptr()),
-        flyc.from_c_void_p(fx.Float32, kv_scale.data_ptr()),
-        float(softmax_scale),
-        batch,
-        num_splits,
-        int(num_splits == 1),
         stream=stream,
     )
 
