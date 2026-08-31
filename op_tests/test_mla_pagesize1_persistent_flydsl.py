@@ -273,7 +273,7 @@ def main():
         "--batch",
         type=int,
         nargs="*",
-        default=[16],
+        default=[8, 16, 32],
         help="Batch sizes. e.g.: -b 1 4 16",
     )
     parser.add_argument(
@@ -281,7 +281,7 @@ def main():
         "--ctx-len",
         type=int,
         nargs="*",
-        default=[1024, 2048, 5000, 8192, 16384, 32768],
+        default=[1024, 2048, 5000, 8192, 16384, 32768, 65536],
         help="Context lengths. e.g.: -c 63 64 65 1024",
     )
     parser.add_argument(
