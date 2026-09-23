@@ -578,9 +578,7 @@ def _torch_reference_cp_rank(case, softmax_scale, cp_world_size, cp_rank):
     )
 
     for batch_id, seq_len in enumerate(case["seq_lens"]):
-        positions = _cp_local_positions(
-            seq_len, cp_world_size, cp_rank, query.device
-        )
+        positions = _cp_local_positions(seq_len, cp_world_size, cp_rank, query.device)
         kv = kv_logical[case["kv_offsets"][batch_id] + positions]
         for q_pos in range(q_seq_len):
             q_row = batch_id * q_seq_len + q_pos
@@ -737,9 +735,7 @@ def _test_cp(
         "cp_world": cp_world_size,
         "max rank us": max(rank_us),
         "max rank err": max(rank_errs),
-        "merged err": _check_output(
-            f"cp W={cp_world_size} merged", reference, merged
-        ),
+        "merged err": _check_output(f"cp W={cp_world_size} merged", reference, merged),
     }
 
 
