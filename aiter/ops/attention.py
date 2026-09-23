@@ -1256,6 +1256,13 @@ def get_mla_metadata_info_v1(
             and packed_qo_len <= 128
             and fast_mode
         )
+        or (
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
+        )
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo

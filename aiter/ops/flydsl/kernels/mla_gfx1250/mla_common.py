@@ -10,6 +10,58 @@ from flydsl.expr.typing import T
 _XOR16_SEL_LO = 0x76543210
 _XOR16_SEL_HI = 0xFEDCBA98 - (1 << 32)
 
+_PIN_VGPR_TYPES = frozenset(
+    [
+        "i32",
+        "f32",
+        "v2i32",
+        "v4i32",
+        "v4f32",
+        "v8f16",
+        "v8i32",
+        "v8f32",
+        "v16i32",
+        "v16f32",
+    ]
+)
+
+
+def _llvm_type_suffix(mlir_type):
+    """LLVM's overload suffix for an MLIR scalar or vector type."""
+    text = str(mlir_type)
+    if text.startswith("vector<"):
+        body = text[len("vector<") : -1]
+        count, _, elem = body.partition("x")
+        return f"v{count}{elem}"
+    return text
+
+
+def pin_vgpr(value, reg):
+    """Hint the allocator to place *value* in the VGPR tuple starting at *reg*.
+
+    Lowers to ``llvm.amdgcn.pin.vgpr``, whose carrier returns its operand
+    unchanged and is erased once the hint is recorded. The hint is soft: when
+    the tuple is unavailable the allocation still succeeds somewhere else, so a
+    request that cannot be honoured costs nothing beyond not being honoured.
+    """
+    from flydsl._mlir.dialects import llvm
+    from flydsl.expr.arith import _to_raw
+
+    raw = _to_raw(value)
+    suffix = _llvm_type_suffix(raw.type)
+    if suffix not in _PIN_VGPR_TYPES:
+        raise TypeError(
+            f"pin_vgpr: {suffix} has no PIN_VGPR pattern; "
+            f"expected one of {sorted(_PIN_VGPR_TYPES)}"
+        )
+    return llvm.call_intrinsic(
+        raw.type,
+        f"llvm.amdgcn.pin.vgpr.{suffix}",
+        [raw, _to_raw(fx.Int32(reg))],
+        [],
+        [],
+    )
+
 
 def _instruction_prefetch(num_pages):
     from flydsl._mlir.dialects import llvm

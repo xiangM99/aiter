@@ -1254,11 +1254,14 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     // pseudo-batches (qk_batch_ratio), which the FlyDSL kernel does not read.
     // Keep it behind AITER_MLA_DECODE_PS1_FLYDSL so gfx1250 persistent ASM
     // (16-head fold + host Q fold) is unchanged when FlyDSL is off.
-    const bool flydsl_ps1 = std::getenv("AITER_MLA_DECODE_PS1_FLYDSL") != nullptr &&
-                            std::atoi(std::getenv("AITER_MLA_DECODE_PS1_FLYDSL")) != 0;
+    const bool flydsl_ps1 =
+        std::getenv("AITER_MLA_DECODE_PS1_FLYDSL") != nullptr &&
+        std::atoi(std::getenv("AITER_MLA_DECODE_PS1_FLYDSL")) != 0;
     const bool gfx1250_flydsl_ps1_heads =
         flydsl_ps1 && (arch_id == "gfx1250") && q_is_fp8 && kv_is_fp8 &&
-        ((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) && (max_seqlen_qo == 1);
+        ((num_heads == 96) ||
+         (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
+          (max_seqlen_qo == 1)));
 
     const bool natively_supported =
         (num_heads == 16) || gfx1250_flydsl_ps1_heads ||

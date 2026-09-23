@@ -5,9 +5,18 @@
 
 One wave always owns 16 Q heads, so the 8 waves of a block split as
 ``head_waves * q_wave_slots`` in the M direction and the rest over the PV output
-dim. 16 heads cover max_seqlen_q 1-4; 32, 64 and 128 heads are decode-only
-(max_seqlen_q=1) because more head waves leave no waves for the M-direction
-query slots.
+dim. 16 heads cover max_seqlen_q 1-4; 32, 64, 96 and 128 heads are decode-only
+because more head waves leave no waves for the M-direction query slots.
+
+96 heads are six 16-head tiles, which does not divide the eight waves. The two
+leftover waves own no heads and skip the score/PV math, but a 64-token KV tile is
+gathered eight rows per wave, so they still build and issue their share of the TDM
+descriptors and take part in every barrier. That keeps the LDS read amplification
+of a tile at 6x instead of 8x.
+
+Above 64 heads the planner never packs more than one query position into a work
+item (``2 * num_heads`` exceeds its packed-Q budget), so those head counts see a
+single query row per item with the causal boundary already folded into ``kv_end``.
 """
 
 import math
@@ -36,13 +45,17 @@ from .mla_common import (
     _xor16_f32,
     make_fp8_wmma_atom,
     make_global_load_b128,
+    pin_vgpr,
 )
 
 BLOCK_THREADS = 256
 WAVE_SIZE = 32
 NUM_WAVES = BLOCK_THREADS // WAVE_SIZE
 HEADS_PER_WAVE = 16
-SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 128)
+SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 96, 128)
+# kPackedQoLenPerWg in the metadata planner: above this the planner emits one
+# query row per work item, whatever max_seqlen_q the caller asked for.
+PLANNER_PACKED_Q_BUDGET = 128
 QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
 QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
@@ -58,6 +71,10 @@ QK_DS_READ_SCHEDULE = (4, 4, 4, 3, 3)
 PV_D_TILES = V_HEAD_DIM // 16
 PV_ACC_DWORDS = 8
 PV_LOAD_DEPTH = 8
+PV_ACC_PIN_BASE = 256
+V_STAGE_PIN_BASE = 128
+K_STAGE_PIN_BASE = 72
+K_STAGE_RING = Q_NOPE_FRAGMENT_COUNT + 1
 PAGE_SIZE = 1
 KV_TILE_TOKENS = 64
 KV_GATHER_ROWS_PER_WAVE = KV_TILE_TOKENS // NUM_WAVES
@@ -107,9 +124,15 @@ def launch_mla_pagesize1_fp8_fp8(
     softmax_scale: fx.Float32,
     num_pages: fx.Int32,
     num_page_indices: fx.Int32,
+    qo_indptr: fx.Pointer,
+    kv_indptr: fx.Pointer,
+    g_kv_indptr: fx.Pointer,
+    cp_world_size: fx.Int32,
+    cp_rank: fx.Int32,
     num_q_heads: fx.Constexpr[int],
     max_seqlen_q: fx.Constexpr[int],
     causal: fx.Constexpr[int],
+    cp_round_robin: fx.Constexpr[int],
     write_final_lse: fx.Constexpr[int],
     num_cus: fx.Constexpr[int],
     lds_size: fx.Constexpr[int],
@@ -120,27 +143,30 @@ def launch_mla_pagesize1_fp8_fp8(
             f"num_q_heads: expected one of {list(SUPPORTED_NUM_Q_HEADS)}, "
             f"got {num_q_heads}"
         )
-    if num_q_heads != HEADS_PER_WAVE and max_seqlen_q != 1:
+    q_tile_rows = 1 if num_q_heads * 2 > PLANNER_PACKED_Q_BUDGET else max_seqlen_q
+    if num_q_heads != HEADS_PER_WAVE and q_tile_rows != 1:
         raise ValueError(
             f"num_q_heads={num_q_heads} only supports max_seqlen_q=1, "
             f"got {max_seqlen_q}"
         )
     head_waves = num_q_heads // HEADS_PER_WAVE
-    q_wave_slots = 1 if max_seqlen_q == 1 else 2 if max_seqlen_q == 2 else 4
+    q_wave_slots = 1 if q_tile_rows == 1 else 2 if q_tile_rows == 2 else 4
     m_waves = head_waves * q_wave_slots
-    if NUM_WAVES % m_waves != 0 or PV_D_TILES % (NUM_WAVES // m_waves) != 0:
+    dv_waves = NUM_WAVES // m_waves
+    compute_waves = m_waves * dv_waves
+    if dv_waves == 0 or PV_D_TILES % dv_waves != 0:
         raise ValueError(
             f"num_q_heads={num_q_heads} with max_seqlen_q={max_seqlen_q} needs "
             f"{m_waves} m-waves, which does not tile {NUM_WAVES} waves x "
             f"{PV_D_TILES} output tiles"
         )
-    dv_waves = NUM_WAVES // m_waves
+    all_waves_compute = compute_waves == NUM_WAVES
 
-    mask_every_tile = bool(causal) and max_seqlen_q > 1
+    mask_every_tile = bool(causal) and (q_tile_rows > 1 or bool(cp_round_robin))
     pv_d_tiles_per_wave = PV_D_TILES // dv_waves
     pv_load_depth = min(PV_LOAD_DEPTH, pv_d_tiles_per_wave)
     q_row_stride = num_q_heads * Q_HEAD_STRIDE
-    output_lds_bytes = max_seqlen_q * num_q_heads * V_HEAD_DIM * 4
+    output_lds_bytes = q_tile_rows * num_q_heads * V_HEAD_DIM * 4
     lds_total_bytes = max(KV_RING_BYTES, output_lds_bytes)
 
     assert (
@@ -163,6 +189,11 @@ def launch_mla_pagesize1_fp8_fp8(
         softmax_scale: fx.Float32,
         num_pages: fx.Int32,
         num_page_indices: fx.Int32,
+        qo_indptr: fx.Pointer,
+        kv_indptr: fx.Pointer,
+        g_kv_indptr: fx.Pointer,
+        cp_world_size: fx.Int32,
+        cp_rank: fx.Int32,
     ):
         """Persistent stage-1 MLA kernel for one-token KV pages."""
         fm_no_inf = (
@@ -178,6 +209,7 @@ def launch_mla_pagesize1_fp8_fp8(
         q_descale = q_scale_t[0]
         kv_descale = kv_scale_t[0]
         score_scale = softmax_scale * q_descale * kv_descale
+        score_scale_log2e = score_scale * fx.Float32(LOG2E)
         rocdl.disable_xdl_arb_stall()
         _instruction_prefetch(INSTRUCTION_PREFETCH_PAGES)
 
@@ -232,26 +264,33 @@ def launch_mla_pagesize1_fp8_fp8(
 
         m_wave = wave_id // dv_waves
         dv_wave = wave_id % dv_waves
+        if const_expr(all_waves_compute):
+            owns_head_row = None
+        else:
+            # The leftover waves gather only. Their m_wave is past the end, so
+            # clamp it to keep every derived index in range; owns_head_row keeps
+            # them from acting on it.
+            owns_head_row = wave_id < fx.Int32(compute_waves)
+            m_wave = owns_head_row.select(m_wave, fx.Int32(m_waves - 1))
+
+        def when_computing(condition):
+            """`condition`, additionally gated on this wave owning a head row."""
+            if const_expr(all_waves_compute):
+                return condition
+            return owns_head_row & condition
+
         q_pos = m_wave // head_waves
         head_wave = m_wave % head_waves
-        # thread id 转换为 head id
         head = head_wave * HEADS_PER_WAVE + head_in_wave
 
         kv_start_quarter = fx.Int32((wave_id & 1) | ((wave_id & 4) >> 1))
         kv_wave_segment_base = kv_start_quarter * KV_SEGMENT_BYTES
 
         def kv_quarter_base(raw_slot, step):
-            """Base of the quarter this wave reads at `step`.
-
-            The XOR only touches ADDR[17:16], and everything added afterwards stays
-            under 64kB, so this is one live base register plus a compile-time XOR
-            immediate rather than a second base per region.
-            """
             slot_base = kv_wave_segment_base + raw_slot * KV_QUARTER_SLOT_BYTES
             return slot_base ^ const_expr(step * KV_SEGMENT_BYTES)
 
         def kv_quarter_token_base(step):
-            """First token index of the quarter this wave reads at `step`."""
             return (kv_start_quarter ^ const_expr(step)) * KV_QUARTER_TOKENS
 
         qk_wmma_k128 = make_fp8_wmma_atom(128)
@@ -274,16 +313,20 @@ def launch_mla_pagesize1_fp8_fp8(
             lds_byte_offset=fx.Index(0),
         )
 
-        def prepare_kv_tile(tile_start, kv_end, raw_slot):
+        def load_page_indices(tile_start):
+            wave_token_start = tile_start + wave_id * KV_GATHER_ROWS_PER_WAVE
+            return (
+                wave_token_start,
+                Vec(buf_load_scalar(page_indices_rsrc, wave_token_start)),
+                Vec(buf_load_scalar(page_indices_rsrc, wave_token_start + 4)),
+            )
+
+        def build_kv_tile_descriptor(page_indices, kv_end, raw_slot):
+            wave_token_start, page_indices_lo, page_indices_hi = page_indices
             wave_quarter_base = (
                 wave_id >> 1
             ) * KV_SEGMENT_BYTES + raw_slot * KV_QUARTER_SLOT_BYTES
             wave_local_row = (wave_id & 1) * KV_GATHER_ROWS_PER_WAVE
-            wave_token_start = tile_start + wave_id * KV_GATHER_ROWS_PER_WAVE
-            page_indices_lo = Vec(buf_load_scalar(page_indices_rsrc, wave_token_start))
-            page_indices_hi = Vec(
-                buf_load_scalar(page_indices_rsrc, wave_token_start + 4)
-            )
             rocdl.sched_barrier(0)
             row_indices = []
             for i in range_constexpr(KV_GATHER_ROWS_PER_WAVE):
@@ -326,7 +369,11 @@ def launch_mla_pagesize1_fp8_fp8(
 
         @flyc.jit
         def issue_kv_tile(tile_start, kv_end, raw_slot):
-            issue_prepared_kv_tile(prepare_kv_tile(tile_start, kv_end, raw_slot))
+            issue_prepared_kv_tile(
+                build_kv_tile_descriptor(
+                    load_page_indices(tile_start), kv_end, raw_slot
+                )
+            )
 
         @flyc.jit
         def wait_kv_tile(has_next, has_second_next):
@@ -404,14 +451,22 @@ def launch_mla_pagesize1_fp8_fp8(
             rocdl.sched_barrier(0)
             p_operand = _rmem_i32(PACKED_PROB_WORDS, probability_words)
 
+            v_stage_ring = min(pv_load_depth + 1, pv_d_tiles_per_wave)
+
+            def stage_v(d_tile):
+                return pin_vgpr(
+                    load_v_operand(raw_slot, d_tile),
+                    V_STAGE_PIN_BASE + (d_tile % v_stage_ring) * PV_ACC_DWORDS,
+                )
+
             updated_outs = []
             staged_v = {}
             for d_tile in range_constexpr(pv_load_depth):
-                staged_v[d_tile] = load_v_operand(raw_slot, d_tile)
+                staged_v[d_tile] = stage_v(d_tile)
             for d_tile in range_constexpr(pv_d_tiles_per_wave):
                 prefetch_tile = d_tile + pv_load_depth
                 if const_expr(prefetch_tile < pv_d_tiles_per_wave):
-                    staged_v[prefetch_tile] = load_v_operand(raw_slot, prefetch_tile)
+                    staged_v[prefetch_tile] = stage_v(prefetch_tile)
                     rocdl.s_wait_dscnt(pv_load_depth * KV_N_TILES)
                 else:
                     rocdl.s_wait_dscnt((pv_d_tiles_per_wave - 1 - d_tile) * KV_N_TILES)
@@ -426,7 +481,14 @@ def launch_mla_pagesize1_fp8_fp8(
                     p_operand,
                     accumulator,
                 )
-                updated_outs.append(Vec(accumulator.load()))
+                updated_outs.append(
+                    Vec(
+                        pin_vgpr(
+                            accumulator.load(),
+                            PV_ACC_PIN_BASE + d_tile * PV_ACC_DWORDS,
+                        )
+                    )
+                )
 
             rocdl.sched_dsrd(pv_load_depth * KV_N_TILES)
             for d_tile in range_constexpr(pv_d_tiles_per_wave):
@@ -436,52 +498,25 @@ def launch_mla_pagesize1_fp8_fp8(
             rocdl.sched_barrier(0)
             return updated_outs
 
-        def process_tile(
+        def compute_tile_state(
             tile_start,
-            kv_start,
-            kv_end,
             attention_end,
+            raw_slot,
             q_nope_operands,
             q_rope_operand,
-            state,
-            mask_bounds=True,
+            running_max,
+            running_sum,
+            pv_ready_outs,
+            mask_bounds,
         ):
-            running_max = fx.Float32(state[0])
-            running_sum = fx.Float32(state[1])
-            running_outs = [
-                Vec(state[2 + d_tile])
+            """QK, softmax and the running max/sum update for one KV tile."""
+            tile_start = fx.Int32(tile_start)
+            running_max = fx.Float32(running_max)
+            running_sum = fx.Float32(running_sum)
+            pv_ready_outs = [
+                Vec(pv_ready_outs[d_tile])
                 for d_tile in range_constexpr(pv_d_tiles_per_wave)
             ]
-            pending_probability_words = Vec(state[2 + pv_d_tiles_per_wave])
-            tile_ordinal = (tile_start - kv_start) // KV_TILE_TOKENS
-            raw_slot = tile_ordinal % KV_RING_STAGES
-            producer_slot = (raw_slot + 3) % KV_RING_STAGES
-            pending_raw_slot = (raw_slot + 4) % KV_RING_STAGES
-
-            next_tile_start = tile_start + KV_TILE_TOKENS
-            second_next_tile_start = tile_start + 2 * KV_TILE_TOKENS
-            wait_kv_tile(next_tile_start < kv_end, second_next_tile_start < kv_end)
-            producer_tile_start = tile_start + 3 * KV_TILE_TOKENS
-            has_producer = producer_tile_start < kv_end
-            safe_producer_start = has_producer.select(producer_tile_start, tile_start)
-            rocdl.s_barrier_signal(-1)
-            producer_descriptor = prepare_kv_tile(
-                safe_producer_start,
-                kv_end,
-                producer_slot,
-            )
-            pv_ready_outs = running_outs
-            if tile_start > kv_start:
-                pv_ready_outs = accumulate_pending_pv(
-                    pending_raw_slot,
-                    pending_probability_words,
-                    running_outs,
-                )
-            rocdl.s_barrier_wait(-1)
-
-            if has_producer:
-                issue_prepared_kv_tile(producer_descriptor)
-
             rocdl.sched_barrier(0)
             qk_accs = []
             pending_k_tile = load_k_tile(raw_slot, 0)
@@ -501,9 +536,14 @@ def launch_mla_pagesize1_fp8_fp8(
                         (Q_NOPE_FRAGMENT_COUNT - 1 - fragment) * 4 + 2 + inflight_next
                     )
                     rocdl.s_wait_dscnt(remaining_ds)
+                    k_slot = n_tile * Q_NOPE_FRAGMENT_COUNT + fragment
                     k_operand = _rmem_i32(
                         Q_NOPE_FRAGMENT_DWORDS,
-                        _concat_wmma_operand(nope_groups[fragment]),
+                        pin_vgpr(
+                            _concat_wmma_operand(nope_groups[fragment]),
+                            K_STAGE_PIN_BASE
+                            + (k_slot % K_STAGE_RING) * Q_NOPE_FRAGMENT_DWORDS,
+                        ),
                     )
                     fx.gemm(
                         qk_wmma_k128,
@@ -545,27 +585,39 @@ def launch_mla_pagesize1_fp8_fp8(
                 )
             tile_has_valid = valid_count > fx.Int32(0)
             negative_inf = fx.Float32(float("-inf"))
-            masked_scores = []
+            raw_scores = []
             for n_tile in range_constexpr(KV_N_TILES):
                 tile_scores = []
                 for i in range_constexpr(QK_ACC_DWORDS):
-                    local_token = (
-                        kv_quarter_token_base(n_tile) + lane_half * QK_ACC_DWORDS + i
-                    )
-                    score = qk_accs[n_tile][i] * score_scale
+                    raw = qk_accs[n_tile][i]
                     if const_expr(mask_bounds):
+                        local_token = (
+                            kv_quarter_token_base(n_tile)
+                            + lane_half * QK_ACC_DWORDS
+                            + i
+                        )
                         valid_token = local_token < valid_count
-                        tile_scores.append(valid_token.select(score, negative_inf))
+                        tile_scores.append(valid_token.select(raw, negative_inf))
                     else:
-                        tile_scores.append(score)
-                masked_scores.append(tile_scores)
+                        tile_scores.append(raw)
+                raw_scores.append(tile_scores)
 
             with fx.fastmath(fm_no_inf):
-                local_max = masked_scores[0][0]
+                partial_maxes = []
                 for n_tile in range_constexpr(KV_N_TILES):
-                    for i in range_constexpr(QK_ACC_DWORDS):
-                        local_max = local_max.maximumf(masked_scores[n_tile][i])
-                tile_max = local_max.maximumf(_xor16_f32(local_max))
+                    n_tile_max = raw_scores[n_tile][0]
+                    for i in range_constexpr(1, QK_ACC_DWORDS):
+                        n_tile_max = n_tile_max.maximumf(raw_scores[n_tile][i])
+                    partial_maxes.append(n_tile_max)
+                local_max = partial_maxes[0]
+                for n_tile in range_constexpr(1, KV_N_TILES):
+                    local_max = local_max.maximumf(partial_maxes[n_tile])
+                raw_tile_max = local_max.maximumf(_xor16_f32(local_max))
+            # Outside the fast-math block: a lane whose whole share of the tile
+            # is masked carries -inf here, and the scaling has to leave it -inf.
+            tile_max = raw_tile_max * score_scale
+
+            with fx.fastmath(fm_no_inf):
                 new_max = running_max.maximumf(tile_max)
                 alpha_arg = tile_has_valid.select(
                     (running_max - new_max) * fx.Float32(LOG2E),
@@ -574,7 +626,7 @@ def launch_mla_pagesize1_fp8_fp8(
             alpha = fx.Float32(rocdl.exp2(T.f32, alpha_arg.ir_value()))
 
             with fx.fastmath(fm_no_inf):
-                neg_new_max = fx.Float32(0.0) - new_max
+                exp_bias = fx.Float32(0.0) - new_max * fx.Float32(LOG2E)
 
             probabilities = []
             sum_vector = Vec.filled(QK_ACC_DWORDS, 0.0, fx.Float32)
@@ -593,15 +645,12 @@ def launch_mla_pagesize1_fp8_fp8(
                             probability_validity.append(valid_token)
                             probability_args.append(
                                 valid_token.select(
-                                    (masked_scores[n_tile][i] - new_max)
-                                    * fx.Float32(LOG2E),
+                                    qk_accs[n_tile][i] * score_scale_log2e + exp_bias,
                                     fx.Float32(0.0),
                                 )
                             )
                     else:
-                        arg_vector = (
-                            qk_accs[n_tile] * score_scale + neg_new_max
-                        ) * fx.Float32(LOG2E)
+                        arg_vector = qk_accs[n_tile] * score_scale_log2e + exp_bias
                         probability_args = [
                             arg_vector[i] for i in range_constexpr(QK_ACC_DWORDS)
                         ]
@@ -650,6 +699,84 @@ def launch_mla_pagesize1_fp8_fp8(
 
             return [new_max, new_sum] + scaled_outs + [packed_probability_words]
 
+        def process_tile(
+            tile_start,
+            kv_start,
+            kv_end,
+            attention_end,
+            q_nope_operands,
+            q_rope_operand,
+            state,
+            mask_bounds=True,
+        ):
+            running_max = fx.Float32(state[0])
+            running_sum = fx.Float32(state[1])
+            running_outs = [
+                Vec(state[2 + d_tile])
+                for d_tile in range_constexpr(pv_d_tiles_per_wave)
+            ]
+            pending_probability_words = Vec(state[2 + pv_d_tiles_per_wave])
+            carried_page_indices = (
+                state[3 + pv_d_tiles_per_wave],
+                Vec(state[4 + pv_d_tiles_per_wave]),
+                Vec(state[5 + pv_d_tiles_per_wave]),
+            )
+            tile_ordinal = (tile_start - kv_start) // KV_TILE_TOKENS
+            raw_slot = tile_ordinal % KV_RING_STAGES
+            producer_slot = (raw_slot + 3) % KV_RING_STAGES
+            pending_raw_slot = (raw_slot + 4) % KV_RING_STAGES
+
+            next_tile_start = tile_start + KV_TILE_TOKENS
+            second_next_tile_start = tile_start + 2 * KV_TILE_TOKENS
+            wait_kv_tile(next_tile_start < kv_end, second_next_tile_start < kv_end)
+            producer_tile_start = tile_start + 3 * KV_TILE_TOKENS
+            has_producer = producer_tile_start < kv_end
+            next_producer_start = tile_start + 4 * KV_TILE_TOKENS
+            safe_next_start = (next_producer_start < kv_end).select(
+                next_producer_start, tile_start
+            )
+            next_page_indices = load_page_indices(safe_next_start)
+            rocdl.s_barrier_signal(-1)
+            producer_descriptor = build_kv_tile_descriptor(
+                carried_page_indices,
+                kv_end,
+                producer_slot,
+            )
+            pv_ready_outs = running_outs
+            if when_computing(tile_start > kv_start):
+                pv_ready_outs = accumulate_pending_pv(
+                    pending_raw_slot,
+                    pending_probability_words,
+                    running_outs,
+                )
+            rocdl.s_barrier_wait(-1)
+
+            if has_producer:
+                issue_prepared_kv_tile(producer_descriptor)
+
+            compute_args = (
+                tile_start,
+                attention_end,
+                raw_slot,
+                q_nope_operands,
+                q_rope_operand,
+                running_max,
+                running_sum,
+                pv_ready_outs,
+                mask_bounds,
+            )
+            if const_expr(all_waves_compute):
+                updated_state = compute_tile_state(*compute_args)
+            else:
+                updated_state = (
+                    [running_max, running_sum]
+                    + pv_ready_outs
+                    + [pending_probability_words]
+                )
+                if owns_head_row:
+                    updated_state = compute_tile_state(*compute_args)
+            return list(updated_state) + list(next_page_indices)
+
         work_start = fx.Int32(rocdl.readfirstlane(T.i32, work_indptr[worker_idx]))
         work_end = fx.Int32(rocdl.readfirstlane(T.i32, work_indptr[worker_idx + 1]))
 
@@ -680,7 +807,34 @@ def launch_mla_pagesize1_fp8_fp8(
             )
             qpos_from_last = work_q_len - fx.Int32(1) - safe_q_pos
             attention_end = kv_end
-            if const_expr(causal):
+            if const_expr(cp_round_robin):
+                batch = work_info_scalar(work_base, 0)
+                request_qo_begin = fx.Int32(
+                    rocdl.readfirstlane(T.i32, qo_indptr[batch])
+                )
+                request_qo_end = fx.Int32(
+                    rocdl.readfirstlane(T.i32, qo_indptr[batch + 1])
+                )
+                global_kv_len = fx.Int32(
+                    rocdl.readfirstlane(T.i32, g_kv_indptr[batch + 1])
+                ) - fx.Int32(rocdl.readfirstlane(T.i32, g_kv_indptr[batch]))
+                q_global = (
+                    global_kv_len
+                    - (request_qo_end - request_qo_begin)
+                    + (qo_start - request_qo_begin)
+                    + safe_q_pos
+                )
+                visible = (q_global >= cp_rank).select(
+                    (q_global - cp_rank) // cp_world_size + fx.Int32(1),
+                    fx.Int32(0),
+                )
+                # Work items address KV relative to kv_indptr[0], as the planner does.
+                local_kv_begin = fx.Int32(
+                    rocdl.readfirstlane(T.i32, kv_indptr[batch])
+                ) - fx.Int32(rocdl.readfirstlane(T.i32, kv_indptr[0]))
+                cut_end = local_kv_begin + visible
+                attention_end = (cut_end < kv_end).select(cut_end, kv_end)
+            elif const_expr(causal):
                 causal_offset = qpos_from_last - kv_offset
                 causal_offset = (causal_offset > fx.Int32(0)).select(
                     causal_offset, fx.Int32(0)
@@ -721,10 +875,15 @@ def launch_mla_pagesize1_fp8_fp8(
 
             has_tokens = kv_start < kv_end
             zero_out = Vec.filled(PV_ACC_DWORDS, 0.0, fx.Float32)
+            seed_producer_start = kv_start + 3 * KV_TILE_TOKENS
+            safe_seed_start = (seed_producer_start < kv_end).select(
+                seed_producer_start, kv_start
+            )
             init_state = (
                 [fx.Float32(float("-inf")), fx.Float32(0.0)]
                 + [zero_out for _ in range_constexpr(pv_d_tiles_per_wave)]
                 + [Vec.filled(PACKED_PROB_WORDS, 0, fx.Int32)]
+                + list(load_page_indices(safe_seed_start))
             )
             remaining_tokens = kv_end - kv_start
             tile_count = (remaining_tokens > fx.Int32(0)).select(
@@ -778,7 +937,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 Vec(loop_results[2 + d_tile])
                 for d_tile in range_constexpr(pv_d_tiles_per_wave)
             ]
-            if has_tokens:
+            if when_computing(has_tokens):
                 last_raw_slot = (tile_count - 1) % KV_RING_STAGES
                 reg_output_accs = accumulate_pending_pv(
                     last_raw_slot,
@@ -832,7 +991,7 @@ def launch_mla_pagesize1_fp8_fp8(
                                 )
 
             def copy_output_to_global(ptr_out, elem_ty, tile_base, q_len):
-                rows = max_seqlen_q * num_q_heads
+                rows = q_tile_rows * num_q_heads
                 valid_rows = q_len * num_q_heads
                 layout = fx.make_layout((rows, V_HEAD_DIM), (V_HEAD_DIM, 1))
                 lds_view = fx.Tensor(
@@ -868,17 +1027,19 @@ def launch_mla_pagesize1_fp8_fp8(
             )
 
             def write_lse(ptr_dst, row_base, q_valid, value):
-                """Store this work item's log-sum-exp for its own q rows."""
-                if q_valid and dv_wave == 0 and lane_half == 0:
+                if q_valid & (dv_wave == 0) & (lane_half == 0):
                     ptr_dst[(row_base + q_pos) * num_q_heads + head] = value
 
             writes_partial = partial_qo_loc >= fx.Int32(0)
             head_tile_elems = num_q_heads * V_HEAD_DIM
+            # A gather-only wave carries a clamped head index that aliases the
+            # last computing wave's rows, so it must not store.
+            owns_output = when_computing(valid_q_pos)
 
             if writes_partial:
-                stage_output_lds(False, reg_output_accs, output_scale, valid_q_pos)
+                stage_output_lds(False, reg_output_accs, output_scale, owns_output)
             else:
-                stage_output_lds(True, reg_output_accs, output_scale, valid_q_pos)
+                stage_output_lds(True, reg_output_accs, output_scale, owns_output)
             rocdl.s_wait_dscnt(0)
             gpu.barrier()
 
@@ -889,7 +1050,7 @@ def launch_mla_pagesize1_fp8_fp8(
                     fx.Int64(partial_qo_loc) * head_tile_elems,
                     work_q_len,
                 )
-                write_lse(ptr_lse, partial_qo_loc, valid_q_pos, lse_value)
+                write_lse(ptr_lse, partial_qo_loc, owns_output, lse_value)
             else:
                 copy_output_to_global(
                     ptr_final,
@@ -900,7 +1061,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 # An un-split work item covers its whole KV run, so this is
                 # already the merged LSE; the reduce never revisits these rows.
                 if const_expr(write_final_lse):
-                    write_lse(ptr_final_lse, qo_start, valid_q_pos, lse_value)
+                    write_lse(ptr_final_lse, qo_start, owns_output, lse_value)
             tdm_ops.tensor_wait(0)
             gpu.barrier()
 
@@ -919,6 +1080,11 @@ def launch_mla_pagesize1_fp8_fp8(
         softmax_scale,
         num_pages,
         num_page_indices,
+        qo_indptr,
+        kv_indptr,
+        g_kv_indptr,
+        cp_world_size,
+        cp_rank,
     ).launch(
         grid=(num_cus, 1, 1),
         block=(BLOCK_THREADS, 1, 1),

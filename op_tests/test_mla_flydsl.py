@@ -8,7 +8,13 @@ Modes:
   :func:`aiter.mla.mla_decode_fwd`.
 * ``ps64`` compares the dedicated page-size-64 FlyDSL kernel with ASM PS64.
 * ``ps1-vs-asm`` compares persistent FlyDSL PS1 with ASM PS64 using the same
-  logical Q/KV values packed into each backend's native layout.
+  logical Q/KV values packed into each backend's native layout. Head counts ASM
+  has no kernel for run there padded up to one it does, so read ``speedup``
+  against the ``asm_heads`` column: at 96 heads ASM is doing 128 heads of work.
+* ``cp`` validates persistent page-size-1 FlyDSL under round-robin context
+  parallelism: global KV position ``p`` lives on rank ``p % W``, each rank is run
+  on its own shard with the causal mask applied on global positions, and the
+  ranks' LSE-merged output is compared with plain full-KV attention.
 
 Examples:
 
@@ -17,6 +23,10 @@ Examples:
   python3 op_tests/test_mla_flydsl.py --mode ps64 --split-kv 0 1 2
   python3 op_tests/test_mla_flydsl.py --mode ps1-vs-asm \
       --num-heads 32 --q-seq-len 1 --varlen
+  python3 op_tests/test_mla_flydsl.py --mode ps1-vs-asm \
+      --num-heads 96 -b 64 -c 8192 --varlen --varlen-min-ratio 0.1
+  python3 op_tests/test_mla_flydsl.py --mode cp --num-heads 16 96 \
+      --q-seq-len 2 4 --cp-world-size 2 4 8 -c 3 64 1200 --varlen
 """
 
 import argparse
@@ -36,21 +46,24 @@ os.environ.setdefault("AITER_MLA_DECODE_PS1_FLYDSL", "1")
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ("gfx1250",)
-MODES = ("ps1", "ps64", "ps1-vs-asm")
-SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 128)
+MODES = ("ps1", "ps64", "ps1-vs-asm", "cp")
+SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 96, 128)
+NHEAD96 = 96
 PS1_Q_SEQ_LENS = {
     16: (1, 2, 3, 4),
     32: (1,),
     64: (1,),
+    96: (1, 2, 3, 4, 6, 8),
     128: (1,),
 }
-# ASM PS64 has no registered (16, 3) kernel.
 COMPARE_Q_SEQ_LENS = {
     16: (1, 2, 4),
     32: (1,),
     64: (1,),
+    96: (1,),
     128: (1,),
 }
+ASM_PADDED_HEADS = {96: 128}
 
 QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
@@ -107,6 +120,13 @@ def _make_seq_lens(batch, ctx_len, varlen, min_ratio):
     cuts = sorted(torch.randint(0, remaining + 1, (batch - 1,)).tolist())
     boundaries = [0, *cuts, remaining]
     return [low + boundaries[index + 1] - boundaries[index] for index in range(batch)]
+
+
+def _min_seq_len(batch, ctx_len, varlen, min_ratio):
+    """Shortest length ``_make_seq_lens`` can return for these arguments."""
+    if not varlen or batch == 1:
+        return ctx_len
+    return min(ctx_len, max(1, round(ctx_len * min_ratio)))
 
 
 def _prefix_sum(values, device):
@@ -225,7 +245,7 @@ def _allocate_ps1_metadata(batch, q_seq_len, nhead):
     ]
 
 
-def _build_ps1_metadata(seq_lens, q_seq_len, nhead, qo_indptr):
+def _build_ps1_metadata(seq_lens, q_seq_len, nhead, qo_indptr, is_cp_round_robin=False):
     device = qo_indptr.device
     kv_indptr = _prefix_sum(seq_lens, device)
     kv_last_page_lens = torch.ones(len(seq_lens), dtype=torch.int32, device=device)
@@ -258,14 +278,19 @@ def _build_ps1_metadata(seq_lens, q_seq_len, nhead, qo_indptr):
         fast_mode=True,
         max_split_per_batch=MAX_SPLIT_PER_BATCH,
         intra_batch_mode=False,
+        is_cp_round_robin=is_cp_round_robin,
         dtype_q_nope=dtypes.fp8,
         dtype_kv_nope=dtypes.fp8,
     )
 
     num_works = int(work_indptr[-1].item())
     work_info = work_info_set[:num_works]
-    if bool((work_info[:, 3] - work_info[:, 2] != q_seq_len).any()):
-        raise RuntimeError("FlyDSL PS1 requires one full query tile per work item")
+    qo_tile_size = 1 if nhead == NHEAD96 else q_seq_len
+    if bool((work_info[:, 3] - work_info[:, 2] != qo_tile_size).any()):
+        raise RuntimeError(
+            f"FlyDSL PS1 nhead={nhead} expects qo tiles of {qo_tile_size}, "
+            f"got {sorted(set((work_info[:, 3] - work_info[:, 2]).tolist()))}"
+        )
 
     return {
         "kv_indptr_ps1": kv_indptr,
@@ -329,12 +354,31 @@ def _add_ps1_layout(case):
     )
 
 
-def _add_ps64_layout(case, num_splits):
+def _pad_query_heads(query, padded_heads):
+    """Widen Q to `padded_heads`, leaving the added heads zero.
+
+    Attention is independent per head, so the original heads read back unchanged
+    from the front of the result and the padding only costs time.
+    """
+    padded = torch.zeros(
+        (query.size(0), padded_heads, query.size(2)),
+        dtype=query.dtype,
+        device=query.device,
+    )
+    padded[:, : query.size(1)].copy_(query)
+    return padded
+
+
+def _add_ps64_layout(case, num_splits, asm_heads=None):
     kv_buffer, page_indices = _pack_kv_ps64(case["kv_logical"], case["seq_lens"])
     pages_per_seq = _pages_per_seq(case["seq_lens"])
+    asm_query = case["query"]
+    if asm_heads is not None and asm_heads != case["nhead"]:
+        asm_query = _pad_query_heads(asm_query, asm_heads)
     case.update(
         {
-            "query_ps64": _pack_q_ps64(case["query"]),
+            "asm_heads": asm_query.size(1),
+            "query_ps64": _pack_q_ps64(asm_query),
             "kv_ps64": kv_buffer,
             "kv_indices_ps64": page_indices,
             "kv_indptr_ps64": _prefix_sum(pages_per_seq, case["query"].device),
@@ -393,11 +437,11 @@ def _torch_reference(case, softmax_scale):
     return output
 
 
-def _decode_output(case):
+def _decode_output(case, nhead=None):
     return torch.empty(
         (
             len(case["seq_lens"]) * case["q_seq_len"],
-            case["nhead"],
+            case["nhead"] if nhead is None else nhead,
             V_HEAD_DIM,
         ),
         dtype=torch.bfloat16,
@@ -507,6 +551,229 @@ def _test_ps1(
     }
 
 
+def _cp_local_positions(seq_len, cp_world_size, cp_rank, device):
+    """Global positions of one request's tokens held by ``cp_rank``, in order."""
+    return torch.arange(seq_len, device=device)[cp_rank::cp_world_size]
+
+
+def _torch_reference_cp_rank(case, softmax_scale, cp_world_size, cp_rank):
+    """One rank's partial attention under round-robin CP.
+
+    Query row ``i`` of a request sits at global position ``seq_len - q_seq + i``
+    and sees the rank's tokens at or before it. Rows that see none of them come
+    back as out=0, lse=-inf, which is what the kernel writes for them.
+    """
+    query = case["query"].float()
+    kv_logical = case["kv_logical"].float()
+    q_scale = float(case["q_scale"][0])
+    kv_scale = float(case["kv_scale"][0])
+    score_scale = softmax_scale * q_scale * kv_scale
+    q_seq_len = case["q_seq_len"]
+    rows = len(case["seq_lens"]) * q_seq_len
+    output = torch.zeros(
+        (rows, case["nhead"], V_HEAD_DIM), dtype=torch.float32, device=query.device
+    )
+    lse = torch.full(
+        (rows, case["nhead"]), float("-inf"), dtype=torch.float32, device=query.device
+    )
+
+    for batch_id, seq_len in enumerate(case["seq_lens"]):
+        positions = _cp_local_positions(
+            seq_len, cp_world_size, cp_rank, query.device
+        )
+        kv = kv_logical[case["kv_offsets"][batch_id] + positions]
+        for q_pos in range(q_seq_len):
+            q_row = batch_id * q_seq_len + q_pos
+            visible = positions <= seq_len - q_seq_len + q_pos
+            if not bool(visible.any()):
+                continue
+            valid_kv = kv[visible]
+            logits = torch.matmul(query[q_row], valid_kv.transpose(0, 1)) * score_scale
+            lse[q_row] = torch.logsumexp(logits, dim=-1)
+            output[q_row] = (
+                torch.matmul(torch.softmax(logits, dim=-1), valid_kv[:, :V_HEAD_DIM])
+                * kv_scale
+            )
+    return output, lse
+
+
+def _check_lse(name, reference, output):
+    finite = torch.isfinite(reference)
+    assert bool(
+        torch.isneginf(output[~finite]).all()
+    ), f"{name}: rows that see no local KV must report lse=-inf"
+    if not bool(finite.any()):
+        return 0.0
+    # Absolute and tight on purpose: one token wrongly let through the round-robin
+    # mask moves a row's LSE by roughly 1/(visible tokens), which a relative
+    # tolerance on LSE values of ~log(len) would swallow at long context.
+    error = checkAllclose(
+        reference[finite],
+        output[finite],
+        rtol=0.0,
+        atol=1e-3,
+        tol_err_ratio=0.05,
+        msg=f"{name}: MLA decode LSE",
+    )
+    assert error <= 0.05, f"{name}: LSE mismatch ratio {error:.2%} exceeds 5%"
+    return error
+
+
+def _merge_cp_ranks(outputs, lses):
+    """Combine per-rank partial attention with the standard LSE merge."""
+    lse = torch.stack(lses)
+    weights = torch.exp(lse - lse.max(0).values).nan_to_num(0.0)
+    merged = (torch.stack([out.float() for out in outputs]) * weights[..., None]).sum(0)
+    return merged / weights.sum(0)[..., None]
+
+
+def _test_cp(
+    batch,
+    ctx_len,
+    nhead,
+    q_seq_len,
+    cp_world_size,
+    num_iters,
+    num_warmup,
+    scales,
+    varlen=False,
+    min_ratio=0.5,
+):
+    case = _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales)
+    min_len = min(case["seq_lens"])
+    if min_len < q_seq_len:
+        raise ValueError(
+            f"every request needs KV length >= q_seq={q_seq_len}, got min {min_len}"
+        )
+    # At max_seqlen_q == 1 the metadata planner emits no work item for a request
+    # whose local shard is empty, so its output row would never be written.
+    if q_seq_len == 1 and min_len < cp_world_size:
+        raise ValueError(
+            f"q_seq=1 needs every request's KV length >= cp_world_size="
+            f"{cp_world_size}, got min {min_len}"
+        )
+    kv_buffer, kv_indices = _pack_kv_ps1(case["kv_logical"])
+    g_kv_indptr = _prefix_sum(case["seq_lens"], kv_buffer.device)
+    softmax_scale = 1.0 / (QK_HEAD_DIM**0.5)
+
+    outputs, lses, rank_errs, rank_us = [], [], [], []
+    for cp_rank in range(cp_world_size):
+        local_positions = [
+            _cp_local_positions(seq_len, cp_world_size, cp_rank, kv_buffer.device)
+            for seq_len in case["seq_lens"]
+        ]
+        local_lens = [positions.numel() for positions in local_positions]
+        local_indices = torch.cat(
+            [
+                kv_indices[case["kv_offsets"][batch_id] + positions]
+                for batch_id, positions in enumerate(local_positions)
+            ]
+        )
+        if local_indices.numel() == 0:
+            local_indices = torch.zeros(1, dtype=torch.int32, device=kv_buffer.device)
+        metadata = _build_ps1_metadata(
+            local_lens, q_seq_len, nhead, case["qo_indptr"], is_cp_round_robin=True
+        )
+        output = _decode_output(case)
+
+        def run(
+            output=output,
+            metadata=metadata,
+            local_indices=local_indices,
+            cp_rank=cp_rank,
+        ):
+            return mla_decode_fwd(
+                case["query"],
+                kv_buffer,
+                output,
+                case["qo_indptr"],
+                metadata["kv_indptr_ps1"],
+                local_indices,
+                metadata["kv_last_page_lens_ps1"],
+                q_seq_len,
+                page_size=1,
+                nhead_kv=1,
+                sm_scale=softmax_scale,
+                work_meta_data=metadata["work_meta_data"],
+                work_indptr=metadata["work_indptr"],
+                work_info_set=metadata["work_info_set"],
+                reduce_indptr=metadata["reduce_indptr"],
+                reduce_final_map=metadata["reduce_final_map"],
+                reduce_partial_map=metadata["reduce_partial_map"],
+                q_scale=case["q_scale"],
+                kv_scale=case["kv_scale"],
+                return_lse=True,
+                g_kv_indptr=g_kv_indptr,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
+                causal=True,
+            )
+
+        _, us = run_perftest(run, num_iters=num_iters, num_warmup=num_warmup)
+        _, final_lse = run()
+        reference, reference_lse = _torch_reference_cp_rank(
+            case, softmax_scale, cp_world_size, cp_rank
+        )
+        name = f"cp W={cp_world_size} rank={cp_rank}"
+        rank_errs.append(_check_output(name, reference, output))
+        _check_lse(name, reference_lse, final_lse.float())
+        empty_rows = torch.isneginf(reference_lse).all(-1)
+        assert bool(
+            (output[empty_rows] == 0).all()
+        ), f"{name}: rows that see no local KV must be written as zero"
+        outputs.append(output)
+        lses.append(final_lse.float())
+        rank_us.append(us)
+
+    reference = _torch_reference(case, softmax_scale)
+    merged = _merge_cp_ranks(outputs, lses)
+    return {
+        "mode": "cp",
+        "batch": batch,
+        "min_ctx": min(case["seq_lens"]),
+        "max_ctx": max(case["seq_lens"]),
+        "nhead": nhead,
+        "q_seq": q_seq_len,
+        "cp_world": cp_world_size,
+        "max rank us": max(rank_us),
+        "max rank err": max(rank_errs),
+        "merged err": _check_output(
+            f"cp W={cp_world_size} merged", reference, merged
+        ),
+    }
+
+
+def test_ps1_cp_round_robin(
+    batch=4,
+    ctx_len=64,
+    q_seq_len=4,
+    nhead=96,
+    cp_world_size=4,
+    varlen=True,
+    varlen_min_ratio=0.5,
+    num_iters=_PERF_NUM_ITERS,
+    num_warmup=_PERF_NUM_WARMUP,
+    scales="poc",
+):
+    if q_seq_len not in PS1_Q_SEQ_LENS[nhead]:
+        raise ValueError(
+            f"PS1 supports q_seq={PS1_Q_SEQ_LENS[nhead]} "
+            f"for nhead={nhead}, got {q_seq_len}"
+        )
+    return _test_cp(
+        batch,
+        ctx_len,
+        nhead,
+        q_seq_len,
+        cp_world_size,
+        num_iters,
+        num_warmup,
+        scales,
+        varlen,
+        varlen_min_ratio,
+    )
+
+
 def test_ps1_persistent_vs_asm_ps64(
     batch=4,
     ctx_len=4096,
@@ -533,15 +800,16 @@ def test_ps1_persistent_vs_asm_ps64(
         varlen_min_ratio,
         scales,
     )
+    asm_heads = ASM_PADDED_HEADS.get(nhead, nhead)
     if not num_splits:
-        num_splits = _auto_num_splits(batch, case["seq_lens"], q_seq_len, nhead)
+        num_splits = _auto_num_splits(batch, case["seq_lens"], q_seq_len, asm_heads)
     _add_ps1_layout(case)
-    _add_ps64_layout(case, num_splits)
+    _add_ps64_layout(case, num_splits, asm_heads)
 
     softmax_scale = 1.0 / (QK_HEAD_DIM**0.5)
     reference = _torch_reference(case, softmax_scale)
     ps1_output = _decode_output(case)
-    asm_output = _decode_output(case)
+    asm_output = _decode_output(case, nhead=asm_heads)
 
     def run_ps1():
         _run_ps1(case, softmax_scale, ps1_output)
@@ -557,6 +825,7 @@ def test_ps1_persistent_vs_asm_ps64(
         "min_ctx": min(case["seq_lens"]),
         "max_ctx": max(case["seq_lens"]),
         "nhead": nhead,
+        "asm_heads": asm_heads,
         "q_seq": q_seq_len,
         "asm_splits": num_splits,
         "ps1_works": case["num_works"],
@@ -564,7 +833,7 @@ def test_ps1_persistent_vs_asm_ps64(
         "asm total us": asm_us,
         "speedup": asm_us / ps1_us,
         "ps1 err": _check_output("ps1", reference, ps1_output),
-        "asm err": _check_output("asm_ps64", reference, asm_output),
+        "asm err": _check_output("asm_ps64", reference, asm_output[:, :nhead]),
     }
 
 
@@ -725,13 +994,13 @@ def _parse_args():
         type=int,
         nargs="+",
         choices=SUPPORTED_NUM_Q_HEADS,
-        default=[16, 32, 64, 128],
+        default=[16, 32, 64, 96, 128],
     )
     parser.add_argument(
         "--q-seq-len",
         type=int,
         nargs="+",
-        choices=(1, 2, 3, 4),
+        choices=(1, 2, 3, 4, 6, 8),
         default=[1, 2, 3, 4],
     )
     parser.add_argument(
@@ -740,6 +1009,13 @@ def _parse_args():
         nargs="+",
         default=[0],
         help="ASM/PS64 split counts; 0 selects automatically.",
+    )
+    parser.add_argument(
+        "--cp-world-size",
+        type=int,
+        nargs="+",
+        default=[2, 4, 8],
+        help="Round-robin CP world sizes for --mode cp.",
     )
     parser.add_argument("--varlen", action="store_true")
     parser.add_argument("--varlen-min-ratio", type=float, default=0.5)
@@ -765,6 +1041,35 @@ def main():
                     batch,
                     ctx_len,
                     num_splits,
+                    args.num_iters,
+                    args.num_warmup,
+                    args.scales,
+                    args.varlen,
+                    args.varlen_min_ratio,
+                )
+            )
+    elif args.mode == "cp":
+        for nhead, q_seq_len, cp_world_size, batch, ctx_len in itertools.product(
+            args.num_heads,
+            args.q_seq_len,
+            args.cp_world_size,
+            args.batch,
+            args.ctx_len,
+        ):
+            if q_seq_len not in PS1_Q_SEQ_LENS[nhead]:
+                continue
+            # A request needs at least q_seq tokens, and at q_seq=1 every rank
+            # must hold one of them (see _test_cp).
+            min_len = _min_seq_len(batch, ctx_len, args.varlen, args.varlen_min_ratio)
+            if min_len < q_seq_len or (q_seq_len == 1 and min_len < cp_world_size):
+                continue
+            rows.append(
+                _test_cp(
+                    batch,
+                    ctx_len,
+                    nhead,
+                    q_seq_len,
+                    cp_world_size,
                     args.num_iters,
                     args.num_warmup,
                     args.scales,
