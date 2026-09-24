@@ -918,7 +918,35 @@ def mla_decode_fwd(
             and (opus_is_fp8 or opus_is_bf16)
         )
 
-        if use_flydsl_ps1:
+        # Opt-in: serve the PS1 stage 1 from the code objects exported from the
+        # FlyDSL kernel (hsa/gfx1250/mla_dsl/mla_dsl.csv), which ship for 96 heads.
+        use_ps1_asm = (
+            use_flydsl_ps1
+            and os.environ.get("AITER_MLA_DECODE_PS1_ASM", "0") == "1"
+            and nhead == 96
+        )
+        if use_ps1_asm:
+            aiter.mla_ps1_fp8_asm_fwd(
+                logits.view(-1, nhead, v_head_dim),
+                attn_lse.view(-1, nhead),
+                o,
+                final_lse,
+                q,
+                kv_buffer,
+                kv_indices,
+                work_indptr,
+                work_info_set,
+                sm_scale,
+                q_scale,
+                kv_scale,
+                causal,
+                qo_indptr,
+                kv_indptr,
+                g_kv_indptr,
+                cp_world_size,
+                cp_rank,
+            )
+        elif use_flydsl_ps1:
             from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
 
             flydsl_mla_pagesize1_fp8_fp8(

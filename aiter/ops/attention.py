@@ -831,6 +831,39 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
+# gfx1250 PS1 FP8 MLA decode stage 1 from the code objects exported from the
+# FlyDSL kernel (hsa/gfx1250/mla_dsl/mla_dsl.csv); same contract as
+# flydsl_mla_pagesize1_fp8_fp8.
+@compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps1_fp8_asm_fwd(
+    # [num_partials, num_heads, 512] fp32
+    split_data: torch.Tensor,
+    # [num_partials, num_heads] fp32
+    split_lse: torch.Tensor,
+    # [total_q, num_heads, 512] bf16
+    final_output: torch.Tensor,
+    # [total_q, num_heads] fp32; None skips the un-split rows' LSE
+    final_lse: torch.Tensor | None,
+    # [total_q, num_heads, 576] fp8
+    q: torch.Tensor,
+    # [num_pages, 1, 1, 576] fp8
+    kv_buffer: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    softmax_scale: float,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    causal: bool,
+    # round-robin CP only (cp_world_size > 1 and causal)
+    qo_indptr: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    g_kv_indptr: torch.Tensor | None = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+) -> None: ...
+
+
 MD_NAME_V4 = "module_mla_v4_asm"
 
 
